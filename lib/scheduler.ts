@@ -1618,7 +1618,7 @@ class Scheduler {
       // If this specific verify lane (or slot) is currently busy in another scan or in global cooling/pacing,
       // sleep and DO NOT pull a candidate group from the queue!
       // This ensures verify workers across multiple parallel scans never collide and respect cross-scan 429 cooldowns.
-      const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, slot, job.scan.id)
+      const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, slot, m.rpd || 500, job.scan.id)
       if (laneBusy.busy) {
         st.state = laneBusy.cooling ? 'cooling' : 'waiting'
         await sleep(1000 + Math.floor(Math.random() * 500))
@@ -1879,7 +1879,7 @@ class Scheduler {
       if (job.stopping) throw new GeminiError('rate', 'Stop requested')
       try {
         if (m) {
-          const laneCheck = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, slot, job.scan.id)
+          const laneCheck = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, slot, m.rpd || 500, job.scan.id)
           if (laneCheck.busy && laneCheck.waitSec && laneCheck.waitSec > 0) {
             const waitMs = Math.min(10_000, laneCheck.waitSec * 1000)
             await this.stoppableSleep(job, waitMs)
@@ -2422,7 +2422,7 @@ class Scheduler {
       // sleep 1 second and DO NOT pull chunk yet.
       // This allows any other worker on an idle/free key (e.g. Key 3 · gemini-3.8, Key 2 · gemini-3.6)
       // to pull from job.queue immediately without any wait!
-      const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0)
+      const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0, m.rpd || 20, job.scan.id)
       if (laneBusy.busy) {
         st.state = laneBusy.cooling ? 'cooling' : 'waiting'
         st.currentChunk = null

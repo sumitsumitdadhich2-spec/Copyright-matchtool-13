@@ -186,11 +186,19 @@ class GlobalGeminiCoordinator {
     waitSec?: number
     cooling?: boolean
   } {
+    // Defensive normalization if 4th argument was inadvertently passed as scanId string
+    let effectiveRpdCap = typeof rpdCap === 'number' && Number.isFinite(rpdCap) ? rpdCap : 500
+    let effectiveScanId = currentScanId
+    if (typeof (rpdCap as unknown) === 'string' && !effectiveScanId) {
+      effectiveScanId = rpdCap as unknown as string
+      effectiveRpdCap = 500
+    }
+
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const now = Date.now()
 
-    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, effectiveRpdCap)) {
       lane.isExhausted = true
       return {
         busy: true,
@@ -200,7 +208,7 @@ class GlobalGeminiCoordinator {
     }
 
     // Check if reserved by another scan
-    if (lane.reservedByScanId && (!currentScanId || lane.reservedByScanId !== currentScanId)) {
+    if (lane.reservedByScanId && (!effectiveScanId || lane.reservedByScanId !== effectiveScanId)) {
       // Auto-expire stale reservation if held > 5 minutes without activating
       if (!lane.activeScanId && lane.reservedAt && now - lane.reservedAt > 300_000) {
         lane.reservedByScanId = null
@@ -219,7 +227,7 @@ class GlobalGeminiCoordinator {
       }
     }
 
-    if (lane.activeScanId && (!currentScanId || lane.activeScanId !== currentScanId)) {
+    if (lane.activeScanId && (!effectiveScanId || lane.activeScanId !== effectiveScanId)) {
       return {
         busy: true,
         activeScanId: lane.activeScanId,

@@ -1014,7 +1014,7 @@ async function laneWorker(
     // If this specific lane is currently busy in another scan or in pacing delay,
     // sleep 1 second and DO NOT pop from queue yet.
     // This allows any other idle/free lane (e.g. other keys) to pop the window immediately!
-    const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, lane.model.id, 0)
+    const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, lane.model.id, 0, lane.model.rpd || 20, id)
     if (laneBusy.busy) {
       await sleep(1000)
       continue
