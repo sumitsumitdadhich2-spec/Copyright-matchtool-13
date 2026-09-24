@@ -1594,7 +1594,10 @@ class Scheduler {
         return
       }
 
-      const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
+      const cool = Math.max(
+        job.cooldownUntil[this.rateKey(lane, m)] || 0,
+        job.cooldownUntil[this.paceSlotKey(lane, m, slot)] || 0,
+      )
       if (cool > Date.now()) {
         st.state = 'cooling'
         st.cooldownUntil = cool
@@ -1844,7 +1847,12 @@ class Scheduler {
             setModelExhausted(m.id, lane.apiKey)
             st.state = 'exhausted'
           } else {
-            job.cooldownUntil[pk] = Date.now() + CHUNK_COOLDOWN_MS
+            const coolUntil = Date.now() + CHUNK_COOLDOWN_MS
+            job.cooldownUntil[this.rateKey(lane, m)] = Math.max(job.cooldownUntil[this.rateKey(lane, m)] || 0, coolUntil)
+            for (let s = 0; s < VERIFY_CONCURRENCY_PER_MODEL; s++) {
+              const pks = this.paceSlotKey(lane, m, s)
+              job.cooldownUntil[pks] = Math.max(job.cooldownUntil[pks] || 0, coolUntil)
+            }
             st.state = 'cooling'
           }
         }
@@ -1893,15 +1901,18 @@ class Scheduler {
         if (e.kind === 'rate' && m) {
           rateRetries++
           const rk = this.rateKey(lane, m)
-          const pk = this.paceSlotKey(lane, m, slot)
           const st = this.modelState(job, lane, m)
 
           if (rateRetries > maxRateRetries) {
-            job.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS
-            job.cooldownUntil[pk] = Date.now() + RATE_COOLDOWN_MS
+            const coolUntil = Date.now() + RATE_COOLDOWN_MS
+            job.cooldownUntil[rk] = Math.max(job.cooldownUntil[rk] || 0, coolUntil)
+            for (let s = 0; s < VERIFY_CONCURRENCY_PER_MODEL; s++) {
+              const pks = this.paceSlotKey(lane, m, s)
+              job.cooldownUntil[pks] = Math.max(job.cooldownUntil[pks] || 0, coolUntil)
+            }
             globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
             st.state = 'cooling'
-            st.cooldownUntil = Date.now() + RATE_COOLDOWN_MS
+            st.cooldownUntil = coolUntil
             this.mark(job)
             throw err
           }
@@ -1910,8 +1921,12 @@ class Scheduler {
           const cooldownMs = RATE_COOLDOWN_MS // 60,000 ms (1 minute)
           const coolUntil = Date.now() + cooldownMs
 
-          job.cooldownUntil[rk] = coolUntil
-          job.cooldownUntil[pk] = coolUntil
+          // Cooldown ALL slots (0, 1, 2) for this (key × model) together
+          job.cooldownUntil[rk] = Math.max(job.cooldownUntil[rk] || 0, coolUntil)
+          for (let s = 0; s < VERIFY_CONCURRENCY_PER_MODEL; s++) {
+            const pks = this.paceSlotKey(lane, m, s)
+            job.cooldownUntil[pks] = Math.max(job.cooldownUntil[pks] || 0, coolUntil)
+          }
           globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, cooldownMs, slot)
 
           st.state = 'cooling'
@@ -1924,7 +1939,11 @@ class Scheduler {
             `Verifier: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx}) — giving 1 min cooldown. Prepared clip is held ready; will send immediately when 1 min completes (attempt ${rateRetries}/${maxRateRetries}).`,
           )
 
-          const waitMs = coolUntil - Date.now()
+          // STAGGERED RETRY:
+          // Add slot-based stagger (slot * 3000ms) so that parallel slots (0, 1, 2) on the same model
+          // don't all wake up at the exact same millisecond and re-trigger a combined RPM 429!
+          const slotStaggerMs = slot * 3000
+          const waitMs = (coolUntil - Date.now()) + slotStaggerMs
           if (waitMs > 0) {
             await this.stoppableSleep(job, waitMs)
           }
@@ -1938,7 +1957,7 @@ class Scheduler {
           addLog(
             job.scan,
             'info',
-            `Verifier: 1 min cooldown ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending prepared request now!`,
+            `Verifier: 1 min cooldown ended for ${displayModelName(m.id)} (key ${lane.idx}, slot ${slot + 1}) — sending prepared request now (staggered +${(slotStaggerMs / 1000).toFixed(1)}s)!`,
           )
           continue
         }
@@ -1988,15 +2007,31 @@ class Scheduler {
     // VERIFY models: gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY (500 RPD each).
     // Instant pre-flight check: ensure quota remaining before cutting clips or uploading
     const pickVerifyModel = (): ModelSpec => {
-      if (!globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) return m
-      const fallback = VERIFY_MODEL_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
-      if (!fallback) {
+      // 1. Prefer original m agar na exhausted hai na busy
+      const originalBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, slot, m.rpd || 500, job.scan.id)
+      if (!originalBusy.exhausted && !originalBusy.busy) return m
+
+      // 2. Pehle try karo koi model jo na exhausted ho na busy (idle)
+      const idleFallback = VERIFY_MODEL_POOL.find((x) => {
+        const b = globalGeminiCoordinator.isLaneBusy(lane.apiKey, x.id, slot, x.rpd || 500, job.scan.id)
+        return !b.exhausted && !b.busy
+      })
+      if (idleFallback) return idleFallback
+
+      // 3. Original agar exhausted nahi hai to wahi rakho (paceAndSend wait kar lega)
+      if (!originalBusy.exhausted) return m
+
+      // 4. Sab busy hain aur original exhausted hai: jo bhi non-exhausted ho (paceAndSend wait karega)
+      const nonExhausted = VERIFY_MODEL_POOL.find(
+        (x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd || 500),
+      )
+      if (!nonExhausted) {
         throw new GeminiError(
           'other',
           `Verify models (${VERIFY_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — group re-queued for another key`,
         )
       }
-      return fallback
+      return nonExhausted
     }
 
     g.status = 'verifying'
@@ -2096,23 +2131,57 @@ class Scheduler {
           // RESCAN models: PRIMARY = gemini-3-flash-preview / gemini-3.5-flash.
           // BACKUP = high-limit lite models (500 RPD each) — jab primaries ki
           // daily limit khatam ho jaye to rescan lite pool par continue hota
-          // hai, kabhi rukta nahi. Use the worker's own model when it is a
-          // primary rescan model, otherwise pick primary first, then backup.
-          const primaryRm = isRescanModel(m.id) && !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)
-            ? m
-            : RESCAN_MODEL_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
-          const backupRm = primaryRm
-            ? null
-            : RESCAN_BACKUP_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
-          const rm = primaryRm || backupRm
-          if (!rm) {
+          // hai, kabhi rukta nahi.
+          // pickRescanModel() checks both exhaustion and cross-scan lane busy state (idle > busy-queue)
+          const pickRescanModel = (): { model: ModelSpec; usedBackup: boolean } => {
+            const check = (x: ModelSpec) =>
+              globalGeminiCoordinator.isLaneBusy(lane.apiKey, x.id, slot, x.rpd || (x.id.includes('lite') ? 500 : 20), job.scan.id)
+
+            // 1. Worker ka apna model agar rescan model hai aur na exhausted hai na busy
+            if (isRescanModel(m.id)) {
+              const ownBusy = check(m)
+              if (!ownBusy.exhausted && !ownBusy.busy) {
+                return { model: m, usedBackup: false }
+              }
+            }
+
+            // 2. Primary pool: pehle idle dhundo (not exhausted && not busy)
+            const idlePrimary = RESCAN_MODEL_POOL.find((x) => {
+              const b = check(x)
+              return !b.exhausted && !b.busy
+            })
+            if (idlePrimary) return { model: idlePrimary, usedBackup: false }
+
+            // 3. Backup pool: agar primary idle nahi mila, to backup pool me idle dhundo
+            // (backup models 500 RPD wale hain, fast aur free hone ke chances zyada)
+            const idleBackup = RESCAN_BACKUP_POOL.find((x) => {
+              const b = check(x)
+              return !b.exhausted && !b.busy
+            })
+            if (idleBackup) return { model: idleBackup, usedBackup: true }
+
+            // 4. Sab busy hain: primary me non-exhausted uthao (paceAndSend wait kar lega)
+            const nonExhaustedPrimary = RESCAN_MODEL_POOL.find(
+              (x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd || 20),
+            )
+            if (nonExhaustedPrimary) return { model: nonExhaustedPrimary, usedBackup: false }
+
+            // 5. Primary exhausted: backup me non-exhausted uthao
+            const nonExhaustedBackup = RESCAN_BACKUP_POOL.find(
+              (x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd || 500),
+            )
+            if (nonExhaustedBackup) return { model: nonExhaustedBackup, usedBackup: true }
+
+            // 6. Sab exhausted: error throw karo (group re-queue hoga)
             throw new GeminiError(
               'other',
               `Rescan models (${[...RESCAN_MODEL_POOL, ...RESCAN_BACKUP_POOL].map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — group re-queued for another key`,
             )
           }
-          if (backupRm) {
-            addLog(scan, 'warn', `Rescan: primary models (${RESCAN_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — BACKUP model ${backupRm.id} (500 RPD) use ho raha hai`)
+
+          const { model: rm, usedBackup } = pickRescanModel()
+          if (usedBackup) {
+            addLog(scan, 'warn', `Rescan: primary models (${RESCAN_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted or busy on key ${lane.idx} — BACKUP model ${rm.id} (500 RPD) use ho raha hai`)
           }
 
           // CANDIDATE-FIRST HINT: chunk-mapping ne jo window claim ki thi, rescan

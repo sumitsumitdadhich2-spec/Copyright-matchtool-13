@@ -969,14 +969,23 @@ class GlobalGeminiCoordinator {
   public reportRateLimit(apiKey: string, modelId: string, cooldownMs: number = RATE_COOLDOWN_MS, slot: number = 0) {
     const kh = apiKeyHash(apiKey)
     const now = Date.now()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
-    lane.cooldownUntil = Math.max(lane.cooldownUntil, now + cooldownMs)
+    const targetCooldown = now + cooldownMs
 
-    // Cooldown only slots for THIS specific model on this API key.
+    // Track the caller's specific slot lane
+    const callingLane = this.getOrCreateLane(apiKey, modelId, slot)
+    callingLane.cooldownUntil = Math.max(callingLane.cooldownUntil, targetCooldown)
+
+    // Ensure all 3 concurrency slots (0, 1, 2) for this model on this key have lane objects and receive cooldown
+    for (let s = 0; s < 3; s++) {
+      const sLane = this.getOrCreateLane(apiKey, modelId, s)
+      sLane.cooldownUntil = Math.max(sLane.cooldownUntil, targetCooldown)
+    }
+
+    // Cooldown any other active or tracked slot lanes for THIS specific model on this API key.
     // Each model has its own independent 250k TPM and 15 RPM quota!
     for (const other of this.lanes.values()) {
       if (other.keyHash === kh && other.modelId === modelId) {
-        other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)
+        other.cooldownUntil = Math.max(other.cooldownUntil, targetCooldown)
       }
     }
 
